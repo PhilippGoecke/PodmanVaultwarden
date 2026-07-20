@@ -8,6 +8,7 @@ CONTAINER_NAME="vaultwarden"
 IMAGE="docker.io/vaultwarden/server:latest"
 DATA_DIR="${HOME}/vaultwarden/data"
 HTTP_PORT=8080
+ADMIN_TOKEN="changeme-admin-token"
 
 start() {
     mkdir -p "${DATA_DIR}"
@@ -19,8 +20,10 @@ start() {
         -v "${DATA_DIR}:/data:Z" \
         -e SIGNUPS_ALLOWED=true \
         -e WEBSOCKET_ENABLED=true \
+        -e ADMIN_TOKEN="${ADMIN_TOKEN}" \
         "${IMAGE}"
     echo "Vaultwarden läuft auf http://localhost:${HTTP_PORT}"
+    echo "Admin-Panel:  http://localhost:${HTTP_PORT}/admin (Token: ${ADMIN_TOKEN})"
 }
 
 stop() {
