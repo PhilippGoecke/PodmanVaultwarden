@@ -1,0 +1,195 @@
+version: '3.8'
+
+services:
+  vaultwarden:
+    image: vaultwarden/server:latest
+    container_name: vaultwarden
+    restart: always
+    environment:
+      DOMAIN: "https://vault.example.com"
+      SIGNUPS_ALLOWED: "false"
+      INVITATIONS_ALLOWED: "true"
+      SHOW_PASSWORD_HINT: "false"
+      LOG_LEVEL: "info"
+      LOG_FILE: "/data/vaultwarden.log"
+      DATABASE_URL: "postgresql://vaultwarden:${DB_PASSWORD}@postgres:5432/vaultwarden"
+      EXTENDED_LOGGING: "true"
+      EXTENDED_LOGGING_FORMAT: "json"
+      ROCKET_ADDRESS: "0.0.0.0"
+      ROCKET_PORT: 80
+      ROCKET_WORKERS: 10
+      ROCKET_LIMITS: "{json=10485760}"
+      ADMIN_TOKEN: "${ADMIN_TOKEN}"
+    volumes:
+      - ./vw-data:/data
+      - ./vw-data/vaultwarden.log:/data/vaultwarden.log
+    ports:
+      - "127.0.0.1:8000:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - vaultwarden-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:80/alive"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: vaultwarden-postgres
+    restart: always
+    environment:
+      POSTGRES_DB: vaultwarden
+      POSTGRES_USER: vaultwarden
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_INITDB_ARGS: "-c shared_buffers=256MB -c max_connections=200"
+    volumes:
+      - ./postgres-data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    networks:
+      - vaultwarden-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vaultwarden"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - DAC_OVERRIDE
+
+  nginx:
+    image: nginx:alpine
+    container_name: vaultwarden-nginx
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+      - ./letsencrypt:/etc/letsencrypt:ro
+    depends_on:
+      - vaultwarden
+    networks:
+      - vaultwarden-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+
+networks:
+  vaultwarden-network:
+    driver: bridge
+
+---
+# nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream vaultwarden {
+        server vaultwarden:80;
+    }
+
+    # Rate limiting
+    limit_req_zone $binary_remote_addr zone=login:10m rate=5r/m;
+    limit_req_zone $binary_remote_addr zone=general:10m rate=100r/m;
+
+    server {
+        listen 80;
+        server_name vault.example.com;
+        return 301 https://$server_name$request_uri;
+    }
+
+    server {
+        listen 443 ssl http2;
+        server_name vault.example.com;
+
+        ssl_certificate /etc/letsencrypt/live/vault.example.com/fullchain.pem;
+        ssl_certificate_key /etc/letsencrypt/live/vault.example.com/privkey.pem;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers HIGH:!aNULL:!MD5;
+        ssl_prefer_server_ciphers on;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 10m;
+
+        client_max_body_size 525M;
+
+        location / {
+            limit_req zone=general burst=20 nodelay;
+            proxy_pass http://vaultwarden;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+            proxy_set_header X-Forwarded-Host $server_name;
+        }
+
+        location /identity/connect/token {
+            limit_req zone=login burst=5 nodelay;
+            proxy_pass http://vaultwarden;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+}
+
+---
+# .env
+DOMAIN=https://vault.example.com
+DB_PASSWORD=your_secure_postgres_password_here
+ADMIN_TOKEN=$(openssl rand -base64 32)
+
+---
+# Deployment instructions:
+#
+# 1. Prerequisites:
+#    - Docker & Docker Compose installed
+#    - Domain name pointing to server
+#    - SSL certificate (use Let's Encrypt with Certbot)
+#
+# 2. Setup:
+#    cp docker-compose.yml docker-compose.prod.yml
+#    cp nginx.conf nginx.prod.conf
+#    cp .env.example .env
+#    - Edit .env with actual values
+#    - Generate ADMIN_TOKEN: openssl rand -base64 32
+#    - Configure SSL certificates in ./ssl directory
+#
+# 3. Create directories:
+#    mkdir -p vw-data postgres-data ssl
+#    chmod 750 postgres-data
+#
+# 4. Deploy:
+#    docker-compose up -d
+#
+# 5. Verify:
+#    docker-compose logs -f vaultwarden
+#    curl https://vault.example.com/alive
+#
+# 6. Maintenance:
+#    - Regular backups: backup ./vw-data and ./postgres-data
+#    - Update: docker-compose pull && docker-compose up -d
+#    - Monitor logs: docker-compose logs vaultwarden
